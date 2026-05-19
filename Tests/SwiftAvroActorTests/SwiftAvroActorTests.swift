@@ -586,17 +586,60 @@ struct DocumentCompileServiceTests {
         let cbService = CompileCallbackService()
         let event     = CompileEventWire(kind: "stdout", text: "Latexmk: Run 1", pdfPath: "")
 
+        var received: CompileEventWire?
         try await withServiceServer(service: cbService, port: 9820) {
             try await withServiceClient(proto: CompileCallbackProtocol.json, port: 9820) { client in
                 try await client.onewayCall(messageName: "onEvent", parameters: [event])
             }
-        }
-
-        var received: CompileEventWire?
-        for await ev in cbService.receivedEvents {
-            received = ev
-            break
+            for await ev in cbService.receivedEvents {
+                received = ev
+                break
+            }
         }
         #expect(received == event)
+    }
+}
+
+// MARK: - ServiceClient multicast
+
+@Suite("ServiceClient")
+struct ServiceClientTests {
+
+    @Test("multicastOnewayCall delivers to all registered endpoints")
+    func multicastDeliversToAll() async throws {
+        let service1 = CursorPresenceService()
+        let service2 = CursorPresenceService()
+        let update   = CursorUpdate(blockId: "§p_0000_broadcast", actorId: "carol")
+
+        let registry = ServiceRegistry()
+        await registry.register(ServiceInfo(
+            name: "cursor-presence", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: 9830), nodeID: "node-A"
+        ))
+        await registry.register(ServiceInfo(
+            name: "cursor-presence", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: 9831), nodeID: "node-B"
+        ))
+
+        var got1: CursorUpdate?
+        var got2: CursorUpdate?
+
+        try await withServiceServer(service: service1, port: 9830) {
+            try await withServiceServer(service: service2, port: 9831) {
+                let sc = ServiceClient(catalogue: registry)
+                await sc.multicastOnewayCall(
+                    serviceName:    "cursor-presence",
+                    clientProtocol: CursorPresenceProtocol.json,
+                    messageName:    "updateCursor",
+                    parameters:     [update]
+                )
+                for await u in service1.receivedUpdates { got1 = u; break }
+                for await u in service2.receivedUpdates { got2 = u; break }
+                try? await sc.shutdown()
+            }
+        }
+
+        #expect(got1 == update)
+        #expect(got2 == update)
     }
 }
