@@ -4,6 +4,60 @@ import SwiftAvroCore
 import SwiftAvroRpc
 @testable import SwiftAvroActor
 
+// MARK: - Service test helpers
+
+private func withServiceServer<S: AvroService>(
+    service: S,
+    port: Int,
+    _ body: () async throws -> Void
+) async throws {
+    let rpc  = SwiftAvroRpc(threads: 1)
+    let ctx  = try await rpc.makeIPCContext()
+    let hash = SwiftAvroRpc.md5Hash(of: service.avroProtocol)
+    let ch   = try await rpc.makeServer(AvroIPCServerConfig(
+        transport:      TCPTransport(host: "127.0.0.1", port: port),
+        context:        ctx,
+        serverHash:     hash,
+        serverProtocol: service.avroProtocol,
+        handler:        service.handler
+    ))
+    do {
+        try await body()
+        try await ch.close()
+        try await rpc.stop()
+    } catch {
+        try? await ch.close()
+        try? await rpc.stop()
+        throw error
+    }
+}
+
+private func withServiceClient(
+    proto: String,
+    port: Int,
+    _ body: (AvroIPCClient) async throws -> Void
+) async throws {
+    let rpc    = SwiftAvroRpc(threads: 1)
+    let ctx    = try await rpc.makeIPCContext()
+    let hash   = SwiftAvroRpc.md5Hash(of: proto)
+    let client = try await rpc.makeClient(AvroIPCClientConfig(
+        transport:      TCPTransport(host: "127.0.0.1", port: port),
+        context:        ctx,
+        clientHash:     hash,
+        clientProtocol: proto,
+        serverHash:     hash
+    ))
+    do {
+        try await body(client)
+        try? await client.disconnect()
+        try? await rpc.stop()
+    } catch {
+        try? await client.disconnect()
+        try? await rpc.stop()
+        throw error
+    }
+}
+
 // MARK: - Fixtures
 
 private func makeInfo(
@@ -322,5 +376,228 @@ struct GossipSyncTests {
             #expect(auth.count == 1)
             #expect(billing.count == 1)
         }
+    }
+}
+
+// MARK: - DocumentSyncService codec tests (no TCP)
+
+@Suite("DocumentSyncService")
+struct DocumentSyncServiceTests {
+
+    @Test("DocumentEventWire round-trips through Avro codec")
+    func documentEventWireCodecRoundTrip() throws {
+        let original = DocumentEventWire(eventJson: #"{"id":"abc","lamport":42}"#)
+        let avro = Avro()
+        let encoded: Data = try avro.encodeFrom(original, schema: DocumentSyncProtocol.eventWireSchema)
+        let decoded: DocumentEventWire = try avro.decodeFrom(from: encoded, schema: DocumentSyncProtocol.eventWireSchema)
+        #expect(decoded == original)
+    }
+
+    @Test("SyncRangeRequest round-trips through Avro codec")
+    func syncRangeRequestCodecRoundTrip() throws {
+        let req = SyncRangeRequest(fromLamport: 10, toLamport: 99)
+        let avro = Avro()
+        let encoded: Data = try avro.encodeFrom(req, schema: DocumentSyncProtocol.syncRangeRequestSchema)
+        let decoded: SyncRangeRequest = try avro.decodeFrom(from: encoded, schema: DocumentSyncProtocol.syncRangeRequestSchema)
+        #expect(decoded == req)
+    }
+
+    @Test("SyncRangeResponse with two events round-trips through Avro codec")
+    func syncRangeResponseCodecRoundTrip() throws {
+        let resp = SyncRangeResponse(events: [
+            DocumentEventWire(eventJson: #"{"id":"e1","lamport":1}"#),
+            DocumentEventWire(eventJson: #"{"id":"e2","lamport":2}"#),
+        ])
+        let avro = Avro()
+        let encoded: Data = try avro.encodeFrom(resp, schema: DocumentSyncProtocol.syncRangeResponseSchema)
+        let decoded: SyncRangeResponse = try avro.decodeFrom(from: encoded, schema: DocumentSyncProtocol.syncRangeResponseSchema)
+        #expect(decoded == resp)
+    }
+
+    @Test("empty SyncRangeResponse encodes and decodes")
+    func emptySyncRangeResponseCodecRoundTrip() throws {
+        let resp = SyncRangeResponse(events: [])
+        let avro = Avro()
+        let encoded: Data = try avro.encodeFrom(resp, schema: DocumentSyncProtocol.syncRangeResponseSchema)
+        let decoded: SyncRangeResponse = try avro.decodeFrom(from: encoded, schema: DocumentSyncProtocol.syncRangeResponseSchema)
+        #expect(decoded.events.isEmpty)
+    }
+
+    @Test("pushEvent handler yields event JSON to receivedEvents stream")
+    func pushEventHandlerYields() async throws {
+        let service = DocumentSyncService()
+        let json    = #"{"id":"evt-1","lamport":7}"#
+        let wire    = DocumentEventWire(eventJson: json)
+
+        try await withServiceServer(service: service, port: 9790) {
+            try await withServiceClient(proto: DocumentSyncProtocol.json, port: 9790) { client in
+                try await client.onewayCall(messageName: "pushEvent", parameters: [wire])
+            }
+        }
+
+        var received: String?
+        for await ev in service.receivedEvents {
+            received = ev
+            break
+        }
+        #expect(received == json)
+    }
+
+    @Test("syncRange handler returns events from provider")
+    func syncRangeHandlerReturnsPeerevents() async throws {
+        let service = DocumentSyncService()
+        let stored  = [#"{"id":"e1","lamport":1}"#, #"{"id":"e2","lamport":2}"#]
+        await service.setSyncProvider { _, _ in stored }
+
+        let req = SyncRangeRequest(fromLamport: 0, toLamport: 10)
+        var response: SyncRangeResponse?
+
+        try await withServiceServer(service: service, port: 9791) {
+            try await withServiceClient(proto: DocumentSyncProtocol.json, port: 9791) { client in
+                response = try await client.call(
+                    messageName: "syncRange",
+                    parameters:  [req],
+                    as:          SyncRangeResponse.self
+                )
+            }
+        }
+
+        #expect(response?.events.count == 2)
+        #expect(response?.events.map(\.eventJson) == stored)
+    }
+
+    @Test("syncRange handler returns empty array when no provider is set")
+    func syncRangeNoProvider() async throws {
+        let service = DocumentSyncService()
+        var response: SyncRangeResponse?
+
+        try await withServiceServer(service: service, port: 9792) {
+            try await withServiceClient(proto: DocumentSyncProtocol.json, port: 9792) { client in
+                response = try await client.call(
+                    messageName: "syncRange",
+                    parameters:  [SyncRangeRequest(fromLamport: 0, toLamport: 100)],
+                    as:          SyncRangeResponse.self
+                )
+            }
+        }
+        #expect(response?.events.isEmpty == true)
+    }
+}
+
+// MARK: - CursorPresenceService codec tests
+
+@Suite("CursorPresenceService")
+struct CursorPresenceServiceTests {
+
+    @Test("CursorUpdate round-trips through Avro codec")
+    func cursorUpdateCodecRoundTrip() throws {
+        let update  = CursorUpdate(blockId: "§p_0000_001", actorId: "alice")
+        let avro    = Avro()
+        let encoded: Data = try avro.encodeFrom(update, schema: CursorPresenceProtocol.cursorUpdateSchema)
+        let decoded: CursorUpdate = try avro.decodeFrom(from: encoded, schema: CursorPresenceProtocol.cursorUpdateSchema)
+        #expect(decoded == update)
+    }
+
+    @Test("updateCursor handler yields CursorUpdate to receivedUpdates stream")
+    func updateCursorHandlerYields() async throws {
+        let service = CursorPresenceService()
+        let update  = CursorUpdate(blockId: "§h_0000_002", actorId: "bob")
+
+        try await withServiceServer(service: service, port: 9800) {
+            try await withServiceClient(proto: CursorPresenceProtocol.json, port: 9800) { client in
+                try await client.onewayCall(messageName: "updateCursor", parameters: [update])
+            }
+        }
+
+        var received: CursorUpdate?
+        for await ev in service.receivedUpdates {
+            received = ev
+            break
+        }
+        #expect(received == update)
+    }
+
+    @Test("unknown message name is silently ignored")
+    func unknownMessageIgnored() throws {
+        let handler = CursorPresenceHandler(continuation: AsyncStream<CursorUpdate>.makeStream().continuation)
+        Task {
+            let result = try await handler.handle(messageName: "bogus", requestData: Data())
+            #expect(result.isEmpty)
+        }
+    }
+}
+
+// MARK: - DocumentCompileService codec tests
+
+@Suite("DocumentCompileService")
+struct DocumentCompileServiceTests {
+
+    @Test("CompileRequest round-trips through Avro codec")
+    func compileRequestCodecRoundTrip() throws {
+        let req = CompileRequest(
+            texPath: "/tmp/doc.tex", outputDir: "/tmp",
+            callbackNodeId: "127.0.0.1:9810",
+            callbackHost: "127.0.0.1", callbackPort: 9811
+        )
+        let avro    = Avro()
+        let encoded: Data = try avro.encodeFrom(req, schema: DocumentCompileProtocol.compileRequestSchema)
+        let decoded: CompileRequest = try avro.decodeFrom(from: encoded, schema: DocumentCompileProtocol.compileRequestSchema)
+        #expect(decoded == req)
+    }
+
+    @Test("CompileEventWire round-trips through Avro codec")
+    func compileEventWireCodecRoundTrip() throws {
+        let event   = CompileEventWire(kind: "success", text: "", pdfPath: "/tmp/doc.pdf")
+        let avro    = Avro()
+        let encoded: Data = try avro.encodeFrom(event, schema: CompileCallbackProtocol.compileEventSchema)
+        let decoded: CompileEventWire = try avro.decodeFrom(from: encoded, schema: CompileCallbackProtocol.compileEventSchema)
+        #expect(decoded == event)
+    }
+
+    @Test("compile handler delivers CompileRequest to registered handler")
+    func compileHandlerDeliversRequest() async throws {
+        let service = DocumentCompileService()
+
+        // Use an actor so the @Sendable closure can mutate state safely.
+        actor Box {
+            var request: CompileRequest?
+            func set(_ r: CompileRequest) { request = r }
+        }
+        let box = Box()
+        await service.setCompileHandler { req in await box.set(req) }
+
+        let req = CompileRequest(
+            texPath: "/tmp/test.tex", outputDir: "/tmp",
+            callbackNodeId: "127.0.0.1:9812",
+            callbackHost: "127.0.0.1", callbackPort: 9812
+        )
+
+        try await withServiceServer(service: service, port: 9810) {
+            try await withServiceClient(proto: DocumentCompileProtocol.serviceJson, port: 9810) { client in
+                try await client.onewayCall(messageName: "compile", parameters: [req])
+            }
+        }
+        // Give the handler a moment to fire (one-way = no response to await).
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(await box.request == req)
+    }
+
+    @Test("callback handler delivers CompileEventWire to receivedEvents stream")
+    func callbackHandlerDeliversEvent() async throws {
+        let cbService = CompileCallbackService()
+        let event     = CompileEventWire(kind: "stdout", text: "Latexmk: Run 1", pdfPath: "")
+
+        try await withServiceServer(service: cbService, port: 9820) {
+            try await withServiceClient(proto: CompileCallbackProtocol.json, port: 9820) { client in
+                try await client.onewayCall(messageName: "onEvent", parameters: [event])
+            }
+        }
+
+        var received: CompileEventWire?
+        for await ev in cbService.receivedEvents {
+            received = ev
+            break
+        }
+        #expect(received == event)
     }
 }
