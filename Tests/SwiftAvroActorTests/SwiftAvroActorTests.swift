@@ -429,16 +429,17 @@ struct DocumentSyncServiceTests {
         let json    = #"{"id":"evt-1","lamport":7}"#
         let wire    = DocumentEventWire(eventJson: json)
 
+        // The stream await must live inside withServiceServer so the server
+        // stays open long enough to deliver the one-way message.
+        var received: String?
         try await withServiceServer(service: service, port: 9790) {
             try await withServiceClient(proto: DocumentSyncProtocol.json, port: 9790) { client in
                 try await client.onewayCall(messageName: "pushEvent", parameters: [wire])
             }
-        }
-
-        var received: String?
-        for await ev in service.receivedEvents {
-            received = ev
-            break
+            for await ev in service.receivedEvents {
+                received = ev
+                break
+            }
         }
         #expect(received == json)
     }
@@ -503,16 +504,15 @@ struct CursorPresenceServiceTests {
         let service = CursorPresenceService()
         let update  = CursorUpdate(blockId: "§h_0000_002", actorId: "bob")
 
+        var received: CursorUpdate?
         try await withServiceServer(service: service, port: 9800) {
             try await withServiceClient(proto: CursorPresenceProtocol.json, port: 9800) { client in
                 try await client.onewayCall(messageName: "updateCursor", parameters: [update])
             }
-        }
-
-        var received: CursorUpdate?
-        for await ev in service.receivedUpdates {
-            received = ev
-            break
+            for await ev in service.receivedUpdates {
+                received = ev
+                break
+            }
         }
         #expect(received == update)
     }
@@ -558,13 +558,9 @@ struct DocumentCompileServiceTests {
     func compileHandlerDeliversRequest() async throws {
         let service = DocumentCompileService()
 
-        // Use an actor so the @Sendable closure can mutate state safely.
-        actor Box {
-            var request: CompileRequest?
-            func set(_ r: CompileRequest) { request = r }
-        }
-        let box = Box()
-        await service.setCompileHandler { req in await box.set(req) }
+        // Route received requests through a stream so the test can await deterministically.
+        let (stream, cont) = AsyncStream<CompileRequest>.makeStream()
+        await service.setCompileHandler { req in cont.yield(req) }
 
         let req = CompileRequest(
             texPath: "/tmp/test.tex", outputDir: "/tmp",
@@ -572,14 +568,17 @@ struct DocumentCompileServiceTests {
             callbackHost: "127.0.0.1", callbackPort: 9812
         )
 
+        var received: CompileRequest?
         try await withServiceServer(service: service, port: 9810) {
             try await withServiceClient(proto: DocumentCompileProtocol.serviceJson, port: 9810) { client in
                 try await client.onewayCall(messageName: "compile", parameters: [req])
             }
+            for await r in stream {
+                received = r
+                break
+            }
         }
-        // Give the handler a moment to fire (one-way = no response to await).
-        try? await Task.sleep(for: .milliseconds(100))
-        #expect(await box.request == req)
+        #expect(received == req)
     }
 
     @Test("callback handler delivers CompileEventWire to receivedEvents stream")
