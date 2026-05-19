@@ -602,6 +602,188 @@ struct DocumentCompileServiceTests {
 
 // MARK: - ServiceClient multicast
 
+// MARK: - Multi-node sync integration
+
+/// Simulates a three-peer AstroPress cluster in-process to verify that:
+/// 1. `multicastOnewayCall` delivers `pushEvent` to **all** registered nodes.
+/// 2. Pushed events arrive at each peer's `receivedEvents` stream.
+/// 3. Lamport clock values are preserved across the Avro transport layer.
+/// 4. `syncRange` returns the exact requested range from a remote peer.
+///
+/// In production this topology runs across Apple Containers; here all
+/// three "nodes" run as lightweight in-process TCP servers.
+@Suite("MultiNodeSync")
+struct MultiNodeSyncTests {
+
+    // Helper: extract the lamportClock field value from a minimal JSON string.
+    private func lamport(from json: String) -> Int? {
+        guard let range = json.range(of: "\"lamportClock\":") else { return nil }
+        let tail = json[range.upperBound...].drop(while: { $0 == " " })
+        let digits = tail.prefix(while: { $0.isNumber })
+        return Int(digits)
+    }
+
+    @Test("three-node cluster: multicast pushEvent preserves Lamport order on all peers")
+    func threeNodeEventPropagation() async throws {
+        let nodeB = DocumentSyncService()
+        let nodeC = DocumentSyncService()
+        let portB = 9840
+        let portC = 9841
+
+        let registry = ServiceRegistry()
+        await registry.register(ServiceInfo(
+            name: "document-sync", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: portB), nodeID: "node-B"))
+        await registry.register(ServiceInfo(
+            name: "document-sync", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: portC), nodeID: "node-C"))
+
+        // Node A generates 3 events with ascending Lamport clocks.
+        let events: [DocumentEventWire] = (1...3).map { i in
+            DocumentEventWire(eventJson: "{\"lamportClock\":\(i),\"by\":\"node-A\"}")
+        }
+
+        var clocksB: [Int] = []
+        var clocksC: [Int] = []
+
+        try await withServiceServer(service: nodeB, port: portB) {
+            try await withServiceServer(service: nodeC, port: portC) {
+                let sc = ServiceClient(catalogue: registry)
+
+                for event in events {
+                    await sc.multicastOnewayCall(
+                        serviceName:    "document-sync",
+                        clientProtocol: DocumentSyncProtocol.json,
+                        messageName:    "pushEvent",
+                        parameters:     [event]
+                    )
+                }
+
+                for await json in nodeB.receivedEvents {
+                    if let c = lamport(from: json) { clocksB.append(c) }
+                    if clocksB.count == events.count { break }
+                }
+                for await json in nodeC.receivedEvents {
+                    if let c = lamport(from: json) { clocksC.append(c) }
+                    if clocksC.count == events.count { break }
+                }
+
+                try? await sc.shutdown()
+            }
+        }
+        nodeB.finish()
+        nodeC.finish()
+
+        #expect(clocksB == [1, 2, 3])
+        #expect(clocksC == [1, 2, 3])
+    }
+
+    @Test("syncRange fetches missing events from a remote peer via ServiceClient.call")
+    func syncRangeCrossNode() async throws {
+        let nodeA = DocumentSyncService()
+        let portA = 9842
+
+        // Node A holds events for Lamport clocks 1–5.
+        let storedJsons = (1...5).map { i in
+            "{\"lamportClock\":\(i),\"by\":\"node-A\"}"
+        }
+        await nodeA.setSyncProvider { from, to in
+            storedJsons.filter { json in
+                guard let c = Int(json.components(separatedBy: "\"lamportClock\":").last?
+                    .prefix(while: { $0.isNumber }) ?? "") else { return false }
+                return Int64(c) >= from && Int64(c) <= to
+            }
+        }
+
+        let registry = ServiceRegistry()
+        await registry.register(ServiceInfo(
+            name: "document-sync", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: portA), nodeID: "node-A"))
+
+        var response: SyncRangeResponse?
+
+        try await withServiceServer(service: nodeA, port: portA) {
+            let sc = ServiceClient(catalogue: registry)
+            response = try await sc.call(
+                serviceName:    "document-sync",
+                clientProtocol: DocumentSyncProtocol.json,
+                messageName:    "syncRange",
+                parameters:     [SyncRangeRequest(fromLamport: 3, toLamport: 5)],
+                as:             SyncRangeResponse.self
+            )
+            try? await sc.shutdown()
+        }
+        nodeA.finish()
+
+        #expect(response?.events.count == 3)
+        let clocks = response?.events.compactMap { lamport(from: $0.eventJson) }
+        #expect(clocks == [3, 4, 5])
+    }
+
+    @Test("two nodes exchange events bidirectionally via syncRange reconciliation")
+    func bidirectionalReconciliation() async throws {
+        // Node A has events 1-3; Node B has events 4-6 (representing a partition then reconnect).
+        let nodeA = DocumentSyncService()
+        let nodeB = DocumentSyncService()
+        let portA = 9843
+        let portB = 9844
+
+        let eventsA = (1...3).map { i in "{\"lamportClock\":\(i),\"by\":\"A\"}" }
+        let eventsB = (4...6).map { i in "{\"lamportClock\":\(i),\"by\":\"B\"}" }
+
+        await nodeA.setSyncProvider { _, _ in eventsA }
+        await nodeB.setSyncProvider { _, _ in eventsB }
+
+        let registryA = ServiceRegistry()
+        let registryB = ServiceRegistry()
+        await registryA.register(ServiceInfo(
+            name: "document-sync", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: portA), nodeID: "node-A"))
+        await registryB.register(ServiceInfo(
+            name: "document-sync", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: portB), nodeID: "node-B"))
+
+        var fromA: SyncRangeResponse?
+        var fromB: SyncRangeResponse?
+
+        try await withServiceServer(service: nodeA, port: portA) {
+            try await withServiceServer(service: nodeB, port: portB) {
+                // B fetches what A has.
+                let scA = ServiceClient(catalogue: registryA)
+                fromA = try await scA.call(
+                    serviceName:    "document-sync",
+                    clientProtocol: DocumentSyncProtocol.json,
+                    messageName:    "syncRange",
+                    parameters:     [SyncRangeRequest(fromLamport: 0, toLamport: 3)],
+                    as:             SyncRangeResponse.self
+                )
+                try? await scA.shutdown()
+
+                // A fetches what B has.
+                let scB = ServiceClient(catalogue: registryB)
+                fromB = try await scB.call(
+                    serviceName:    "document-sync",
+                    clientProtocol: DocumentSyncProtocol.json,
+                    messageName:    "syncRange",
+                    parameters:     [SyncRangeRequest(fromLamport: 4, toLamport: 6)],
+                    as:             SyncRangeResponse.self
+                )
+                try? await scB.shutdown()
+            }
+        }
+        nodeA.finish()
+        nodeB.finish()
+
+        #expect(fromA?.events.count == 3)
+        #expect(fromB?.events.count == 3)
+
+        let clocksFromA = fromA?.events.compactMap { lamport(from: $0.eventJson) }
+        let clocksFromB = fromB?.events.compactMap { lamport(from: $0.eventJson) }
+        #expect(clocksFromA == [1, 2, 3])
+        #expect(clocksFromB == [4, 5, 6])
+    }
+}
+
 @Suite("ServiceClient")
 struct ServiceClientTests {
 
