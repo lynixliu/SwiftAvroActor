@@ -5,13 +5,17 @@ import SwiftAvroRpc
 // MARK: - Wire type
 
 /// Discriminated-union wire container for one-way ephemeral messages.
-/// `type` is "bullet" or "readerPresence"; `json` carries the JSON-encoded payload.
 public struct EphemeralMessage: Codable, Sendable, Equatable {
     public let type: String
     public let json: String
     public init(type: String, json: String) {
         self.type = type
         self.json = json
+    }
+
+    public enum MessageType {
+        public static let bullet         = "bullet"
+        public static let readerPresence = "readerPresence"
     }
 }
 
