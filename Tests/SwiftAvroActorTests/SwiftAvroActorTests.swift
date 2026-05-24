@@ -527,6 +527,88 @@ struct CursorPresenceServiceTests {
     }
 }
 
+// MARK: - EphemeralBroadcastService tests
+
+@Suite("EphemeralBroadcastService")
+struct EphemeralBroadcastServiceTests {
+
+    @Test("EphemeralMessage round-trips through Avro codec")
+    func ephemeralMessageCodecRoundTrip() throws {
+        let msg     = EphemeralMessage(type: "bullet", json: "{\"text\":\"hello\"}")
+        let avro    = Avro()
+        let encoded: Data = try avro.encodeFrom(msg, schema: EphemeralBroadcastProtocol.messageSchema)
+        let decoded: EphemeralMessage = try avro.decodeFrom(from: encoded, schema: EphemeralBroadcastProtocol.messageSchema)
+        #expect(decoded == msg)
+    }
+
+    @Test("broadcast handler yields EphemeralMessage to receivedMessages stream")
+    func broadcastHandlerYields() async throws {
+        let service = EphemeralBroadcastService()
+        let msg     = EphemeralMessage(type: "readerPresence", json: "{\"actorId\":\"carol\"}")
+
+        var received: EphemeralMessage?
+        try await withServiceServer(service: service, port: 9850) {
+            try await withServiceClient(proto: EphemeralBroadcastProtocol.json, port: 9850) { client in
+                try await client.onewayCall(messageName: "broadcast", parameters: [msg])
+            }
+            for await ev in service.receivedMessages {
+                received = ev
+                break
+            }
+        }
+        #expect(received == msg)
+    }
+
+    @Test("unknown message name is silently ignored")
+    func unknownMessageIgnored() throws {
+        let handler = EphemeralBroadcastHandler(continuation: AsyncStream<EphemeralMessage>.makeStream().continuation)
+        Task {
+            let result = try await handler.handle(messageName: "bogus", requestData: Data())
+            #expect(result.isEmpty)
+        }
+    }
+
+    @Test("multicastOnewayCall delivers bullet EphemeralMessage to two peers")
+    func multicastDeliversToBothPeers() async throws {
+        let serviceA = EphemeralBroadcastService()
+        let serviceB = EphemeralBroadcastService()
+        let msg      = EphemeralMessage(type: "bullet", json: "{\"text\":\"danmaku\"}")
+
+        let registry = ServiceRegistry()
+        await registry.register(ServiceInfo(
+            name: "ephemeral-broadcast", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: 9851), nodeID: "node-A"
+        ))
+        await registry.register(ServiceInfo(
+            name: "ephemeral-broadcast", version: "1.0.0",
+            endpoint: .tcp(host: "127.0.0.1", port: 9852), nodeID: "node-B"
+        ))
+
+        var gotA: EphemeralMessage?
+        var gotB: EphemeralMessage?
+
+        try await withServiceServer(service: serviceA, port: 9851) {
+            try await withServiceServer(service: serviceB, port: 9852) {
+                let sc = ServiceClient(catalogue: registry)
+                await sc.multicastOnewayCall(
+                    serviceName:    "ephemeral-broadcast",
+                    clientProtocol: EphemeralBroadcastProtocol.json,
+                    messageName:    "broadcast",
+                    parameters:     [msg]
+                )
+                for await m in serviceA.receivedMessages { gotA = m; break }
+                for await m in serviceB.receivedMessages { gotB = m; break }
+                try? await sc.shutdown()
+            }
+        }
+        serviceA.finish()
+        serviceB.finish()
+
+        #expect(gotA == msg)
+        #expect(gotB == msg)
+    }
+}
+
 // MARK: - DocumentCompileService codec tests
 
 @Suite("DocumentCompileService")
