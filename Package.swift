@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "SwiftAvroActor", targets: ["SwiftAvroActor"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/lynixliu/SwiftAvroCore", branch: "master"),
+        .package(url: "https://github.com/lynixliu/SwiftAvroCore", from: "2.1.0"),
         .package(url: "https://github.com/apple/swift-cluster-membership.git", branch: "main"),
     ],
     targets: [
