@@ -1,5 +1,5 @@
 {
-  "originHash" : "2f61633b2f6f544527b37daff9dd21c22cd7e0245923a77db849c45794107821",
+  "originHash" : "34c6f9db72093a97464bfefde222177e8a741dd5f87dde02f2625e59cbe03a85",
   "pins" : [
     {
       "identity" : "swift-algorithms",
@@ -170,6 +170,15 @@
       "state" : {
         "revision" : "7c6ad0fc39d0763e0b699210e4124afd5041c5df",
         "version" : "1.6.4"
+      }
+    },
+    {
+      "identity" : "swiftavrocore",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/lynixliu/SwiftAvroCore",
+      "state" : {
+        "branch" : "master",
+        "revision" : "ad20aea016ccf0bea76e439ab05e7b0bdb636f6c"
       }
     }
   ],
