@@ -177,7 +177,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/lynixliu/SwiftAvroCore",
       "state" : {
-        "revision" : "f51ae5e41b460194bdac137e44b22e182fa2fed1",
+        "revision" : "4ee66b4dd1718ecea5b15ebda20caff890014858",
         "version" : "2.2.0"
       }
     }

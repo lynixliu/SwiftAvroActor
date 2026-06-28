@@ -28,6 +28,10 @@ public struct GossipTLS: Sendable {
     /// Convenience: server identity from a PEM certificate/key pair, client using the
     /// system trust store.
     ///
+    /// This is **one-way TLS** — peers authenticate this node's server certificate, but
+    /// this node does not authenticate connecting peers. For a closed cluster use
+    /// ``mutual(certificateFile:privateKeyFile:trustRootsFile:)`` instead.
+    ///
     /// - Parameters:
     ///   - certificateFile: Path to the PEM certificate chain file.
     ///   - privateKeyFile:  Path to the PEM private key file.
@@ -38,6 +42,36 @@ public struct GossipTLS: Sendable {
         GossipTLS(
             server: try .server(certificateFile: certificateFile, privateKeyFile: privateKeyFile),
             client: try .client()
+        )
+    }
+
+    /// Convenience: **mutual TLS** for a private-CA cluster.
+    ///
+    /// Both the inbound server and the outbound client present this node's certificate and
+    /// verify the peer's certificate against `trustRootsFile` (the shared CA, typically the
+    /// cluster leader's CA). A peer without a CA-signed certificate is rejected at the
+    /// handshake, in both directions.
+    ///
+    /// - Parameters:
+    ///   - certificateFile: Path to this node's PEM certificate chain.
+    ///   - privateKeyFile:  Path to this node's PEM private key.
+    ///   - trustRootsFile:  Path to the PEM CA certificate(s) used to verify peers.
+    public static func mutual(
+        certificateFile: String,
+        privateKeyFile:  String,
+        trustRootsFile:  String
+    ) throws -> GossipTLS {
+        GossipTLS(
+            server: try .mutualServer(
+                certificateFile: certificateFile,
+                privateKeyFile:  privateKeyFile,
+                trustRootsFile:  trustRootsFile
+            ),
+            client: try .mutualClient(
+                certificateFile: certificateFile,
+                privateKeyFile:  privateKeyFile,
+                trustRootsFile:  trustRootsFile
+            )
         )
     }
 }
