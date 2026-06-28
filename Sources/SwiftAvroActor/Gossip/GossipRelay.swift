@@ -16,17 +16,21 @@ public actor GossipRelay {
     private let proto:            String
     private let hash:             MD5Hash
     private let gossipPortOffset: Int
+    private let tls:              AvroTLSConfig?
 
     private var peers:     [String: Int]           = [:]  // nodeID → gossip TCP port
     private var clients:   [String: AvroIPCClient] = [:]
     private var watchTask: Task<Void, Never>?
 
-    /// - Parameter gossipPortOffset: Gossip TCP port = SWIM UDP port + this offset. Defaults to 1.
-    public init(gossipPortOffset: Int = 1) {
+    /// - Parameters:
+    ///   - gossipPortOffset: Gossip TCP port = SWIM UDP port + this offset. Defaults to 1.
+    ///   - tls: TLS settings for outbound gossip connections. `nil` (the default) uses plain TCP.
+    public init(gossipPortOffset: Int = 1, tls: GossipTLS? = nil) {
         self.gossipPortOffset = gossipPortOffset
         self.proto            = GossipProtocol.json
         self.hash             = SwiftAvroRpc.md5Hash(of: GossipProtocol.json)
         self.rpc              = SwiftAvroRpc(threads: 1)
+        self.tls              = tls?.client
     }
 
     /// Begins watching ``ClusterNode/events`` in a background task and updates the peer table.
@@ -110,7 +114,8 @@ public actor GossipRelay {
             context:        context,
             clientHash:     hash,
             clientProtocol: proto,
-            serverHash:     hash
+            serverHash:     hash,
+            tls:            tls
         ))
         clients[nodeID] = client
         return client

@@ -1,7 +1,8 @@
 import Testing
 import Foundation
+import NIOSSL
 import SwiftAvroCore
-import SwiftAvroRpc
+@testable import SwiftAvroRpc
 @testable import SwiftAvroActor
 
 // MARK: - Service test helpers
@@ -908,5 +909,125 @@ struct ServiceClientTests {
 
         #expect(got1 == update)
         #expect(got2 == update)
+    }
+}
+
+// MARK: - Gossip TLS
+
+/// Generates temporary PEM files for a self-signed CA and a server cert (CN=127.0.0.1)
+/// signed by that CA. The temporary directory is removed when the closure returns.
+///
+/// - Parameters passed to `body`: `(caPEM, serverCertPEM, serverKeyPEM)`.
+private func withTemporaryCerts<T>(
+    _ body: (String, String, String) async throws -> T
+) async throws -> T {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("SwiftAvroActorTLS-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let caKey  = tmp.appendingPathComponent("ca-key.pem").path
+    let caCert = tmp.appendingPathComponent("ca-cert.pem").path
+    let srvKey = tmp.appendingPathComponent("server-key.pem").path
+    let srvCrt = tmp.appendingPathComponent("server-cert.pem").path
+    let srvCSR = tmp.appendingPathComponent("server.csr").path
+
+    // Runs openssl to completion; throws if it exits non-zero. (Fire-and-forget
+    // would delete the temp dir mid-generation.)
+    func openssl(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
+        process.arguments = arguments
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "openssl", code: Int(process.terminationStatus),
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "openssl \(arguments.first ?? "") exited \(process.terminationStatus)"])
+        }
+    }
+
+    try openssl([
+        "req", "-x509", "-new", "-newkey", "rsa:2048",
+        "-keyout", caKey, "-out", caCert, "-days", "365",
+        "-nodes", "-subj", "/CN=SwiftAvroActorTestCA"
+    ])
+    try openssl([
+        "req", "-new", "-newkey", "rsa:2048",
+        "-keyout", srvKey, "-out", srvCSR,
+        "-nodes", "-subj", "/CN=127.0.0.1"
+    ])
+    try openssl([
+        "x509", "-req", "-in", srvCSR,
+        "-CA", caCert, "-CAkey", caKey, "-CAcreateserial",
+        "-out", srvCrt, "-days", "365"
+    ])
+
+    return try await body(caCert, srvCrt, srvKey)
+}
+
+/// Builds an `AvroTLSConfig` that trusts the given CA PEM file for client-side use.
+private func clientTLS(caPEM: String) throws -> AvroTLSConfig {
+    let ca  = try NIOSSLCertificate.fromPEMFile(caPEM)
+    var cfg = TLSConfiguration.makeClientConfiguration()
+    cfg.trustRoots = .certificates(ca)
+    // The server cert's CN is an IP (127.0.0.1), which cannot appear in SNI, so skip
+    // hostname matching while still validating the chain against our CA.
+    cfg.certificateVerification = .noHostnameVerification
+    return AvroTLSConfig(sslContext: try NIOSSLContext(configuration: cfg))
+}
+
+@Suite("GossipTLS")
+struct GossipTLSTests {
+
+    @Test("propagate over TLS registers the service in the peer's registry")
+    func propagateOverTLS() async throws {
+        try await withTemporaryCerts { caPEM, certPEM, keyPEM in
+            let port = 9951
+            let tls  = GossipTLS(
+                server: try .server(certificateFile: certPEM, privateKeyFile: keyPEM),
+                client: try clientTLS(caPEM: caPEM)
+            )
+
+            // Inbound gossip server with TLS.
+            let registry = ServiceRegistry()
+            let catalog  = GossipCatalog(local: registry, relay: GossipRelay(tls: tls), tls: tls)
+            _ = try await catalog.startGossipServer(host: "127.0.0.1", port: port)
+
+            // TLS client speaking the gossip protocol sends one `propagate`.
+            let rpc  = SwiftAvroRpc(threads: 1)
+            let ctx  = try await rpc.makeIPCContext()
+            let hash = SwiftAvroRpc.md5Hash(of: GossipProtocol.json)
+            let wire = ServiceInfoWire(from: makeInfo(name: "billing", nodeID: "node-X"))
+
+            do {
+                let client = try await rpc.makeSecureClient(
+                    host: "127.0.0.1", port: port, tls: tls.client,
+                    context: ctx, clientHash: hash,
+                    clientProtocol: GossipProtocol.json, serverHash: hash
+                )
+                try await client.onewayCall(messageName: "propagate", parameters: [wire])
+                try? await client.disconnect()
+            } catch {
+                try? await rpc.stop()
+                try? await catalog.shutdown()
+                throw error
+            }
+
+            // onewayCall does not await a server response; poll until the
+            // handler has registered the entry.
+            var found: [ServiceInfo] = []
+            for _ in 0..<50 {
+                found = await registry.discover(serviceName: "billing")
+                if !found.isEmpty { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+
+            try await rpc.stop()
+            try await catalog.shutdown()
+
+            #expect(found.count == 1)
+            #expect(found.first?.nodeID == "node-X")
+        }
     }
 }

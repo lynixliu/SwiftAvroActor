@@ -40,13 +40,20 @@ public actor GossipCatalog: ServiceCatalog {
     private let local:            ServiceRegistry
     private let relay:            GossipRelay
     private let rpc:              SwiftAvroRpc
+    private let tls:              GossipTLS?
     private var server:           AvroServerChannel?
     private var antiEntropyTask:  Task<Void, Never>?
 
-    public init(local: ServiceRegistry, relay: GossipRelay) {
+    /// - Parameters:
+    ///   - local: The local service registry backing this catalog.
+    ///   - relay: The gossip relay used to propagate registrations to peers.
+    ///   - tls: TLS settings for the inbound gossip server and anti-entropy clients.
+    ///     `nil` (the default) uses plain TCP. Use the same `GossipTLS` you pass to `relay`.
+    public init(local: ServiceRegistry, relay: GossipRelay, tls: GossipTLS? = nil) {
         self.local = local
         self.relay = relay
         self.rpc   = SwiftAvroRpc(threads: 1)
+        self.tls   = tls
     }
 
     // MARK: - Gossip server lifecycle
@@ -66,7 +73,8 @@ public actor GossipCatalog: ServiceCatalog {
             context:        context,
             serverHash:     hash,
             serverProtocol: proto,
-            handler:        GossipHandler(registry: local)
+            handler:        GossipHandler(registry: local),
+            tls:            tls?.server
         ))
         server = channel
         return channel
@@ -111,7 +119,8 @@ public actor GossipCatalog: ServiceCatalog {
                         context:        context,
                         clientHash:     hash,
                         clientProtocol: proto,
-                        serverHash:     hash
+                        serverHash:     hash,
+                        tls:            self.tls?.client
                     ))
                     let response: SyncResponse = try await client.call(
                         messageName: "sync",

@@ -1,0 +1,34 @@
+name: Swift 6 Build
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # macOS uses the system Xcode toolchain; setup-swift would pin an older
+      # Swift whose compiler can't read the newer Xcode SDK (toolchain/SDK mismatch).
+      - name: Setup Swift 6 (Linux)
+        if: runner.os == 'Linux'
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.1"
+
+      # NIOSSL links the system OpenSSL on Linux (used by the gossip TLS test).
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libssl-dev
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Run Tests
+        run: swift test
